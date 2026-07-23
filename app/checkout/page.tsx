@@ -1,0 +1,434 @@
+'use client';
+
+export const dynamic = 'force-dynamic';
+
+import { useEffect, useState, useCallback, FormEvent } from 'react';
+import { useRouter } from 'next/navigation';
+import Image from 'next/image';
+import Script from 'next/script';
+import { useCart } from '@/contexts/CartContext';
+import { useAuth } from '@/contexts/AuthContext';
+import { productService } from '@/lib/services/productService';
+import { orderService } from '@/lib/services/orderService';
+import { Product, Order, CategoryOffer, FestivalConfig } from '@/lib/types';
+import { NEXT_PUBLIC_RAZORPAY_KEY_ID } from '@/lib/clientConfig';
+import { resolveProductPrice } from '@/lib/saleUtils';
+
+interface CartItemWithDetails {
+    productId: string;
+    quantity: number;
+    product: Product;
+    customization?: {
+        text?: string;
+        imageUrl?: string;
+    };
+}
+
+declare global {
+    interface Window {
+        Razorpay: any;
+    }
+}
+
+export default function CheckoutPage() {
+    const { cart, clearCart } = useCart();
+    const { user, loading: authLoading } = useAuth();
+    const router = useRouter();
+
+    const [cartItems, setCartItems] = useState<CartItemWithDetails[]>([]);
+    const [categoryOffers, setCategoryOffers] = useState<CategoryOffer[]>([]);
+    const [festivalConfig, setFestivalConfig] = useState<FestivalConfig | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [submitting, setSubmitting] = useState(false);
+
+    // Form state
+    const [name, setName] = useState('');
+    const [address, setAddress] = useState('');
+    const [city, setCity] = useState('');
+    const [state, setState] = useState('');
+    const [pincode, setPincode] = useState('');
+    const [phone, setPhone] = useState('');
+
+    const loadData = useCallback(async () => {
+        setLoading(true);
+        try {
+            const [categoryOffersData, festivalConfigData] = await Promise.all([
+                fetch('/api/category-offers').then(res => res.json()),
+                fetch('/api/festival-config').then(res => res.json()),
+            ]);
+            setCategoryOffers(categoryOffersData);
+            setFestivalConfig(festivalConfigData);
+
+            const itemsWithDetails: (CartItemWithDetails | null)[] = await Promise.all(
+                cart.map(async (item) => {
+                    const product = await productService.getProduct(item.productId);
+                    if (product) {
+                        return {
+                            ...item,
+                            product,
+                        };
+                    }
+                    return null;
+                })
+            );
+            setCartItems(itemsWithDetails.filter((item): item is CartItemWithDetails => item !== null));
+        } catch (error) {
+            console.error('Error loading data:', error);
+        } finally {
+            setLoading(false);
+        }
+    }, [cart]);
+
+    useEffect(() => {
+        if (!authLoading && user === null) {
+            router.push('/login');
+            return;
+        }
+        if (user) {
+            loadData();
+        }
+    }, [user, loadData, router, authLoading]);
+
+    const subtotal = cartItems.reduce(
+        (sum, item) => sum + item.product.price * item.quantity,
+        0
+    );
+
+    const total = cartItems.reduce(
+        (sum, item) => {
+            const status = resolveProductPrice(item.product, categoryOffers, festivalConfig);
+            return sum + status.currentPrice * item.quantity;
+        },
+        0
+    );
+
+    const handlePayment = async (orderId: string, amount: number) => {
+        try {
+            // 1. Create Razorpay Order on Server
+            const response = await fetch('/api/razorpay/create-order', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount, orderId }),
+            });
+            const data = await response.json();
+
+            if (!data.id) {
+                throw new Error('Server error in creating Razorpay order');
+            }
+
+            // 2. Open Razorpay Checkout
+            const options = {
+                key: NEXT_PUBLIC_RAZORPAY_KEY_ID,
+                amount: data.amount,
+                currency: data.currency,
+                name: 'Tuhfina Creation',
+                description: 'Luxury Gift Purchase',
+                // image: 'YOUR_LOGO_URL', // Should come from assets, using brand name for now
+                order_id: data.id,
+                handler: async function (response: any) {
+                    // 3. Verify Payment
+                    try {
+                        const verifyRes = await fetch('/api/razorpay/verify', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                razorpay_order_id: response.razorpay_order_id,
+                                razorpay_payment_id: response.razorpay_payment_id,
+                                razorpay_signature: response.razorpay_signature,
+                                orderId: orderId,
+                            }),
+                        });
+
+                        const verifyData = await verifyRes.json();
+
+                        if (verifyData.success) {
+                            clearCart();
+                            router.push('/dashboard?orderSuccess=true');
+                        } else {
+                            alert('Payment verification failed. Please contact support.');
+                        }
+                    } catch (error) {
+                        console.error('Verification error:', error);
+                        alert('Payment verification error.');
+                    }
+                },
+                prefill: {
+                    name: name,
+                    email: user?.email,
+                    contact: phone,
+                },
+                theme: {
+                    color: '#D4AF37', // Luxury Gold
+                },
+                modal: {
+                    ondismiss: function () {
+                        setSubmitting(false);
+                    }
+                }
+            };
+
+            if (typeof window.Razorpay === 'undefined') {
+                throw new Error('Razorpay SDK not loaded. Please check your internet connection.');
+            }
+            const rzp = new window.Razorpay(options);
+            rzp.on('payment.failed', function (response: any) {
+                alert('Payment Failed: ' + response.error.description);
+                setSubmitting(false);
+            });
+            rzp.open();
+
+        } catch (error) {
+            console.error('Payment initialization failed:', error);
+            alert('Could not start payment. Please try again.');
+            setSubmitting(false);
+        }
+    };
+
+    const handleSubmit = async (e: FormEvent) => {
+        e.preventDefault();
+
+        if (!user) {
+            alert('Please login to continue');
+            router.push('/login');
+            return;
+        }
+
+        setSubmitting(true);
+
+        try {
+            // 0. Create Pending Order in Firestore
+            const orderData: Omit<Order, 'id' | 'createdAt'> = {
+                userId: user.id,
+                userEmail: user.email!,
+                items: cartItems.map(item => {
+                    const status = resolveProductPrice(item.product, categoryOffers, festivalConfig);
+                    return {
+                        productId: item.productId,
+                        title: item.product.title,
+                        price: status.currentPrice,
+                        quantity: item.quantity,
+                        imageUrl: item.product.images[0] || '',
+                        customization: item.customization,
+                    };
+                }),
+                totalAmount: total,
+                status: 'pending',
+                shippingAddress: {
+                    name,
+                    address,
+                    city,
+                    state,
+                    pincode,
+                    phone,
+                },
+                paymentStatus: 'PENDING'
+            } as any; // Cast to any because Order type might not be updated yet
+
+            const orderId = await orderService.createOrder(orderData);
+
+            // Proceed to Payment
+            await handlePayment(orderId, total);
+
+        } catch (error) {
+            console.error('Error creating order:', error);
+            alert('Failed to create order. Please try again.');
+            setSubmitting(false);
+        }
+    };
+
+    if (loading) {
+        return (
+            <div className="min-h-screen flex items-center justify-center">
+                <div className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-luxury-gold border-t-transparent"></div>
+            </div>
+        );
+    }
+
+    if (cartItems.length === 0) {
+        router.push('/cart');
+        return null;
+    }
+
+    return (
+        <div className="bg-white min-h-screen">
+            <Script src="https://checkout.razorpay.com/v1/checkout.js" />
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
+                <h1 className="text-4xl font-serif font-bold text-luxury-black mb-12">
+                    Checkout
+                </h1>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
+                    {/* Shipping Form */}
+                    <div className="lg:col-span-2">
+                        <div className="bg-white border border-gray-200 rounded-lg p-8">
+                            <h2 className="text-2xl font-serif font-semibold mb-6">
+                                Shipping Information
+                            </h2>
+
+                            <form onSubmit={handleSubmit} className="space-y-6">
+                                <div>
+                                    <label className="block text-sm font-medium text-luxury-black mb-2">
+                                        Full Name *
+                                    </label>
+                                    <input
+                                        type="text"
+                                        required
+                                        value={name}
+                                        onChange={(e) => setName(e.target.value)}
+                                        className="input-luxury"
+                                        placeholder="John Doe"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-luxury-black mb-2">
+                                        Phone Number *
+                                    </label>
+                                    <input
+                                        type="tel"
+                                        required
+                                        value={phone}
+                                        onChange={(e) => setPhone(e.target.value)}
+                                        className="input-luxury"
+                                        placeholder="+91 XXXXX XXXXX"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-luxury-black mb-2">
+                                        Address *
+                                    </label>
+                                    <textarea
+                                        required
+                                        value={address}
+                                        onChange={(e) => setAddress(e.target.value)}
+                                        className="input-luxury"
+                                        rows={3}
+                                        placeholder="Street address, apartment, suite, etc."
+                                    />
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    <div>
+                                        <label className="block text-sm font-medium text-luxury-black mb-2">
+                                            City *
+                                        </label>
+                                        <input
+                                            type="text"
+                                            required
+                                            value={city}
+                                            onChange={(e) => setCity(e.target.value)}
+                                            className="input-luxury"
+                                            placeholder="Mumbai"
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-medium text-luxury-black mb-2">
+                                            State *
+                                        </label>
+                                        <input
+                                            type="text"
+                                            required
+                                            value={state}
+                                            onChange={(e) => setState(e.target.value)}
+                                            className="input-luxury"
+                                            placeholder="Maharashtra"
+                                        />
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-sm font-medium text-luxury-black mb-2">
+                                        PIN Code *
+                                    </label>
+                                    <input
+                                        type="text"
+                                        required
+                                        value={pincode}
+                                        onChange={(e) => setPincode(e.target.value)}
+                                        className="input-luxury"
+                                        placeholder="400001"
+                                    />
+                                </div>
+
+                                <button
+                                    type="submit"
+                                    disabled={submitting}
+                                    className="w-full btn-luxury disabled:opacity-50 disabled:cursor-not-allowed uppercase tracking-wider font-semibold py-4"
+                                >
+                                    {submitting ? 'Processing Payment...' : 'Pay & Place Order'}
+                                </button>
+                                <p className="text-xs text-center text-gray-500 mt-2">
+                                    Secured by Razorpay. UPI, Cards & Netbanking accepted.
+                                </p>
+                            </form>
+                        </div>
+                    </div>
+
+                    {/* Order Summary */}
+                    <div className="lg:col-span-1">
+                        <div className="bg-luxury-cream rounded-lg p-8 sticky top-24">
+                            <h2 className="text-2xl font-serif font-bold text-luxury-black mb-6">
+                                Order Summary
+                            </h2>
+
+                            <div className="space-y-4 mb-6">
+                                {cartItems.map((item) => (
+                                    <div key={item.productId} className="flex gap-4">
+                                        <div className="relative h-16 w-16 flex-shrink-0 bg-gray-100 rounded overflow-hidden">
+                                            {item.product.images && item.product.images.length > 0 ? (
+                                                <Image
+                                                    src={item.product.images[0]}
+                                                    alt={item.product.title}
+                                                    fill
+                                                    className="object-cover"
+                                                />
+                                            ) : (
+                                                <div className="w-full h-full flex items-center justify-center text-2xl">
+                                                    🎁
+                                                </div>
+                                            )}
+                                        </div>
+                                        <div className="flex-1">
+                                            <p className="text-sm font-medium text-luxury-black line-clamp-1">
+                                                {item.product.title}
+                                            </p>
+                                            <p className="text-sm text-luxury-gray">
+                                                Qty: {item.quantity}
+                                            </p>
+                                        </div>
+                                        <span className="text-sm font-semibold text-luxury-gold">
+                                            ₹{resolveProductPrice(item.product, categoryOffers, festivalConfig).currentPrice * item.quantity}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div className="border-t border-gray-300 pt-4 space-y-2">
+                                <div className="flex justify-between text-luxury-gray">
+                                    <span>Subtotal</span>
+                                    <span>₹{subtotal}</span>
+                                </div>
+                                {subtotal > total && (
+                                    <div className="flex justify-between text-green-600 font-medium">
+                                        <span>Sale Savings</span>
+                                        <span>-₹{subtotal - total}</span>
+                                    </div>
+                                )}
+                                <div className="flex justify-between text-luxury-gray">
+                                    <span>Shipping</span>
+                                    <span>FREE</span>
+                                </div>
+                                <div className="flex justify-between text-xl font-bold text-luxury-black pt-2">
+                                    <span>Total</span>
+                                    <span className="text-luxury-gold">₹{total}</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}

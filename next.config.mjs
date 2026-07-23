@@ -1,0 +1,51 @@
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  staticPageGenerationTimeout: 300,
+  experimental: {
+    serverComponentsExternalPackages: ['mongodb', 'mongoose', 'firebase-admin', 'nodemailer', 'pdfkit', 'razorpay', 'bcryptjs'],
+  },
+  images: {
+    formats: ['image/avif', 'image/webp'],
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048, 3840],
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'firebasestorage.googleapis.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'images.unsplash.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'res.cloudinary.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'sl.bing.net',
+      },
+      {
+        protocol: 'https',
+        hostname: 'drive.google.com',
+      },
+      {
+        protocol: 'https',
+        hostname: 'lh3.googleusercontent.com',
+      },
+    ],
+  },
+  compiler: {
+    removeConsole: process.env.NODE_ENV === 'production' ? { exclude: ['error', 'warn'] } : false,
+  },
+  async redirects() {
+    return [
+      {
+        source: '/signup',
+        destination: '/register',
+        permanent: true,
+      },
+    ];
+  },
+};
+
+export default nextConfig;
